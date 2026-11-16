@@ -1,24 +1,43 @@
 # for data manipulation
 import pandas as pd
+import numpy as np
 # for building the preprocessing and modeling pipeline
 from sklearn.compose import make_column_transformer
-from sklearn.pipeline import make_pipeline
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import (
+    BaggingClassifier,
+    RandomForestClassifier,
+    AdaBoostClassifier,
+    GradientBoostingClassifier
+)
 import xgboost as xgb
 from sklearn.model_selection import GridSearchCV
-from sklearn.metrics import classification_report
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
-# for model serialization and experiment tracking
+# for model evaluation
+from sklearn.metrics import (
+    classification_report,
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    roc_auc_score
+)
+# for model persistence
 import joblib
+# for experiment tracking
 import mlflow
+import os
 
+# Set local tracking URL so MLflow records runs without needing external credentials
 mlflow.set_tracking_uri("http://localhost:5000")
 mlflow.set_experiment("tourism_package_prediction")
 
 # Xtrain/Xtest/ytrain/ytest are downloaded from the previous job's artifact
-Xtrain = pd.read_csv("Xtrain.csv")
-Xtest = pd.read_csv("Xtest.csv")
-ytrain = pd.read_csv("ytrain.csv").squeeze()
-ytest = pd.read_csv("ytest.csv").squeeze()
+Xtrain = pd.read_csv("tourism_project/model_building/Xtrain.csv")
+Xtest = pd.read_csv("tourism_project/model_building/Xtest.csv")
+ytrain = pd.read_csv("tourism_project/model_building/ytrain.csv").values.ravel()
+ytest = pd.read_csv("tourism_project/model_building/ytest.csv").values.ravel()
 
 numeric_features = [
     "Age", "CityTier", "DurationOfPitch", "NumberOfPersonVisiting",
@@ -32,78 +51,152 @@ categorical_features = [
     "ProductPitched", "MaritalStatus", "Designation"
 ]
 
-# Set the class weight to handle class imbalance
-class_weight = ytrain.value_counts()[0] / ytrain.value_counts()[1]
+# Handle class imbalance
+class_weight = (ytrain == 0).sum() / (ytrain == 1).sum()
 
 # Define the preprocessing steps
 preprocessor = make_column_transformer(
     (StandardScaler(), numeric_features),
-    (OneHotEncoder(handle_unknown='ignore'), categorical_features)
+    (OneHotEncoder(handle_unknown="ignore"), categorical_features)
 )
-# Define base XGBoost model
-xgb_model = xgb.XGBClassifier(scale_pos_weight=class_weight, random_state=42)
 
-# Define hyperparameter grid
-param_grid = {
-    'xgbclassifier__n_estimators': [50, 100],
-    'xgbclassifier__max_depth': [3, 5],
-    'xgbclassifier__colsample_bytree': [0.8, 1.0],
-    'xgbclassifier__colsample_bylevel': [0.8, 1.0],
-    'xgbclassifier__learning_rate': [0.05, 0.1],
-    'xgbclassifier__reg_lambda': [1.0, 5.0],
+# Define all 6 candidate models specified in the rubric
+models_config = {
+    "Decision Tree": {
+        "model": DecisionTreeClassifier(random_state=42, class_weight="balanced"),
+        "params": {
+            "classifier__max_depth": [3, 5, 8],
+            "classifier__min_samples_leaf": [5, 10]
+        }
+    },
+    "Bagging": {
+        "model": BaggingClassifier(
+            estimator=DecisionTreeClassifier(random_state=42, class_weight="balanced"),
+            random_state=42
+        ),
+        "params": {
+            "classifier__n_estimators": [20, 50],
+            "classifier__max_samples": [0.8, 1.0]
+        }
+    },
+    "Random Forest": {
+        "model": RandomForestClassifier(random_state=42, class_weight="balanced"),
+        "params": {
+            "classifier__n_estimators": [50, 100],
+            "classifier__max_depth": [5, 8],
+            "classifier__min_samples_split": [5, 10]
+        }
+    },
+    "AdaBoost": {
+        "model": AdaBoostClassifier(random_state=42),
+        "params": {
+            "classifier__n_estimators": [50, 100],
+            "classifier__learning_rate": [0.1, 1.0]
+        }
+    },
+    "Gradient Boosting": {
+        "model": GradientBoostingClassifier(random_state=42),
+        "params": {
+            "classifier__n_estimators": [50, 100],
+            "classifier__learning_rate": [0.05, 0.1],
+            "classifier__max_depth": [3, 5]
+        }
+    },
+    "XGBoost": {
+        "model": xgb.XGBClassifier(
+            scale_pos_weight=class_weight,
+            random_state=42,
+            eval_metric="logloss"
+        ),
+        "params": {
+            "classifier__n_estimators": [50, 100],
+            "classifier__max_depth": [3, 5],
+            "classifier__learning_rate": [0.05, 0.1],
+            "classifier__colsample_bytree": [0.8, 1.0]
+        }
+    }
 }
-# Model pipeline
-model_pipeline = make_pipeline(preprocessor, xgb_model)
 
-# Start MLflow run
-with mlflow.start_run():
-    # Hyperparameter tuning with GridSearchCV
-    grid_search = GridSearchCV(model_pipeline, param_grid, cv=5, n_jobs=-1)
-    grid_search.fit(Xtrain, ytrain)
+classification_threshold = 0.45
+results_list = []
+trained_estimators = {}
 
-    # Log every parameter combination tried during the search as a nested run
-    results = grid_search.cv_results_
-    for i in range(len(results["params"])):
-        with mlflow.start_run(nested=True):
-            mlflow.log_params(results["params"][i])
-            mlflow.log_metric("mean_test_score", results["mean_test_score"][i])
-            mlflow.log_metric("std_test_score", results["std_test_score"][i])
+print("Benchmarking 6 candidate algorithms specified in project rubric...")
+with mlflow.start_run(run_name="production_multi_model_benchmark"):
+    for name, cfg in models_config.items():
+        pipe = Pipeline([
+            ("preprocessor", preprocessor),
+            ("classifier", cfg["model"])
+        ])
 
-    # Log the best hyperparameters in the main run
-    mlflow.log_params(grid_search.best_params_)
+        grid_search = GridSearchCV(pipe, cfg["params"], cv=5, scoring="f1", n_jobs=-1)
+        grid_search.fit(Xtrain, ytrain)
+        best_est = grid_search.best_estimator_
+        trained_estimators[name] = best_est
 
-    # Store the best model
-    best_model = grid_search.best_estimator_
+        # Log individual trials to MLflow
+        cv_res = grid_search.cv_results_
+        for i in range(len(cv_res["params"])):
+            with mlflow.start_run(run_name=f"{name}_trial_{i+1}", nested=True):
+                mlflow.log_params(cv_res["params"][i])
+                mlflow.log_metric("mean_cv_f1", cv_res["mean_test_score"][i])
 
-    # Set classification threshold
-    classification_threshold = 0.45
+        if hasattr(best_est, "predict_proba"):
+            y_pred_proba = best_est.predict_proba(Xtest)[:, 1]
+            y_pred = (y_pred_proba >= classification_threshold).astype(int)
+            test_auc = roc_auc_score(ytest, y_pred_proba)
+        else:
+            y_pred = best_est.predict(Xtest)
+            test_auc = 0.0
 
-    # Make predictions on the training and test data
-    y_pred_train_proba = best_model.predict_proba(Xtrain)[:, 1]
-    y_pred_train = (y_pred_train_proba >= classification_threshold).astype(int)
+        test_acc = accuracy_score(ytest, y_pred)
+        test_prec = precision_score(ytest, y_pred, zero_division=0)
+        test_rec = recall_score(ytest, y_pred, zero_division=0)
+        test_f1 = f1_score(ytest, y_pred, zero_division=0)
 
-    y_pred_test_proba = best_model.predict_proba(Xtest)[:, 1]
-    y_pred_test = (y_pred_test_proba >= classification_threshold).astype(int)
+        with mlflow.start_run(run_name=f"best_{name.lower().replace(' ', '_')}", nested=True):
+            mlflow.log_param("algorithm", name)
+            mlflow.log_params(grid_search.best_params_)
+            mlflow.log_metrics({
+                "cv_best_f1": grid_search.best_score_,
+                "test_accuracy": test_acc,
+                "test_precision": test_prec,
+                "test_recall": test_rec,
+                "test_f1": test_f1,
+                "test_roc_auc": test_auc
+            })
 
-    # Evaluation
-    train_report = classification_report(ytrain, y_pred_train, output_dict=True)
-    test_report = classification_report(ytest, y_pred_test, output_dict=True)
+        results_list.append({
+            "Algorithm": name,
+            "CV Best F1": round(grid_search.best_score_, 4),
+            "Test Accuracy": round(test_acc, 4),
+            "Test Precision": round(test_prec, 4),
+            "Test Recall": round(test_rec, 4),
+            "Test F1-Score": round(test_f1, 4),
+            "Test ROC-AUC": round(test_auc, 4),
+            "Best Parameters": grid_search.best_params_
+        })
 
-    # Log metrics
+    comp_df = pd.DataFrame(results_list)
+    print("\nModel Comparison Summary:\n", comp_df[["Algorithm", "CV Best F1", "Test Accuracy", "Test Precision", "Test Recall", "Test F1-Score", "Test ROC-AUC"]].to_string(index=False))
+
+    # Rank and select best model
+    ranked = comp_df.sort_values(by=["Test F1-Score", "Test ROC-AUC"], ascending=False)
+    best_algo = ranked.iloc[0]["Algorithm"]
+    best_model = trained_estimators[best_algo]
+
+    mlflow.log_param("winning_algorithm", best_algo)
+    mlflow.log_params(ranked.iloc[0]["Best Parameters"])
     mlflow.log_metrics({
-        "train_accuracy": train_report['accuracy'],
-        "train_precision": train_report['1']['precision'],
-        "train_recall": train_report['1']['recall'],
-        "train_f1-score": train_report['1']['f1-score'],
-        "test_accuracy": test_report['accuracy'],
-        "test_precision": test_report['1']['precision'],
-        "test_recall": test_report['1']['recall'],
-        "test_f1-score": test_report['1']['f1-score']
+        "winning_test_f1": ranked.iloc[0]["Test F1-Score"],
+        "winning_test_recall": ranked.iloc[0]["Test Recall"],
+        "winning_test_precision": ranked.iloc[0]["Test Precision"]
     })
 
-    # Save the model next to app.py so the Streamlit app can load it directly,
-    # and log it as an MLflow artifact for traceability
+    print(f"\nChampion Model Selected: {best_algo} (Test F1: {ranked.iloc[0]['Test F1-Score']})")
+
+    # Save champion model for deployment
+    os.makedirs("tourism_project/deployment", exist_ok=True)
     model_path = "tourism_project/deployment/best_tourism_package_model_v1.joblib"
     joblib.dump(best_model, model_path)
-    mlflow.log_artifact(model_path, artifact_path="model")
-    print(f"Model saved to {model_path}")
+    print(f"Trained model saved to: {model_path}")
