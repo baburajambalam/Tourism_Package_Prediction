@@ -180,20 +180,21 @@ with mlflow.start_run(run_name="production_multi_model_benchmark"):
     comp_df = pd.DataFrame(results_list)
     print("\nModel Comparison Summary:\n", comp_df[["Algorithm", "CV Best F1", "Test Accuracy", "Test Precision", "Test Recall", "Test F1-Score", "Test ROC-AUC"]].to_string(index=False))
 
-    # Rank and select best model
-    ranked = comp_df.sort_values(by=["Test F1-Score", "Test ROC-AUC"], ascending=False)
-    best_algo = ranked.iloc[0]["Algorithm"]
+    # Select champion model: Explicitly designate XGBoost
+    best_algo = "XGBoost"
     best_model = trained_estimators[best_algo]
+    xgb_row = comp_df[comp_df["Algorithm"] == best_algo].iloc[0]
 
     mlflow.log_param("winning_algorithm", best_algo)
-    mlflow.log_params(ranked.iloc[0]["Best Parameters"])
+    mlflow.log_params(xgb_row["Best Parameters"])
     mlflow.log_metrics({
-        "winning_test_f1": ranked.iloc[0]["Test F1-Score"],
-        "winning_test_recall": ranked.iloc[0]["Test Recall"],
-        "winning_test_precision": ranked.iloc[0]["Test Precision"]
+        "winning_test_f1": xgb_row["Test F1-Score"],
+        "winning_test_recall": xgb_row["Test Recall"],
+        "winning_test_precision": xgb_row["Test Precision"],
+        "winning_test_roc_auc": xgb_row["Test ROC-AUC"]
     })
 
-    print(f"\nChampion Model Selected: {best_algo} (Test F1: {ranked.iloc[0]['Test F1-Score']})")
+    print(f"\nChampion Model Selected: {best_algo} (Test Recall: {xgb_row['Test Recall']}, Test F1: {xgb_row['Test F1-Score']})")
 
     # Save champion model for deployment
     os.makedirs("tourism_project/deployment", exist_ok=True)
