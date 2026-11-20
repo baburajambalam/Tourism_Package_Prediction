@@ -33,11 +33,24 @@ import os
 mlflow.set_tracking_uri("http://localhost:5000")
 mlflow.set_experiment("tourism_package_prediction")
 
-# Xtrain/Xtest/ytrain/ytest are downloaded from the previous job's artifact
-Xtrain = pd.read_csv("tourism_project/model_building/Xtrain.csv")
-Xtest = pd.read_csv("tourism_project/model_building/Xtest.csv")
-ytrain = pd.read_csv("tourism_project/model_building/ytrain.csv").values.ravel()
-ytest = pd.read_csv("tourism_project/model_building/ytest.csv").values.ravel()
+# Robust loader for split files across local, Colab, and GitHub Actions runner environments
+def load_split(name):
+    candidates = [
+        name,
+        os.path.join("tourism_project", "model_building", name),
+        os.path.join(".", name),
+        os.path.join("..", name),
+        os.path.join("tourism_project", "data", name)
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return pd.read_csv(c)
+    return pd.read_csv(name)
+
+Xtrain = load_split("Xtrain.csv")
+Xtest = load_split("Xtest.csv")
+ytrain = load_split("ytrain.csv").values.ravel()
+ytest = load_split("ytest.csv").values.ravel()
 
 numeric_features = [
     "Age", "CityTier", "DurationOfPitch", "NumberOfPersonVisiting",
